@@ -267,7 +267,7 @@ if run:
             else:
                 st.markdown(f"""
                 <div class="verdict-review">
-                    <div class="verdict-label">⚠ REVIEW</div>
+                    <div class="verdict-label">Needs a human brain 🧠</div>
                     <div class="verdict-sub">Some checks need manual review</div>
                 </div>""", unsafe_allow_html=True)
 
