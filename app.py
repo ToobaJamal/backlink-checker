@@ -70,7 +70,7 @@ html, body, [class*="css"] {
     border-color: var(--red) !important;
     box-shadow: 0 0 0 2px rgba(208,48,58,0.2) !important;
 }
-label { color: var(--navy) !important; font-size: 0.82rem !important; }
+label { color: rgba(255,255,255,0.6) !important; font-size: 0.82rem !important; }
 
 /* Button */
 .stButton > button {
@@ -168,7 +168,6 @@ with col2:
     st.markdown("""
     <div style="padding-top:8px">
         <p class="gmp-title">Backlink Checker</p>
-        <p class="gmp-subtitle">Site vetting tool — powered by Gemini & SEMrush</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -183,37 +182,54 @@ run = st.button("Run checks →")
 # ── Results ───────────────────────────────────────────────────────────────────
 
 CHECK_LABELS = {
-    "traffic":            "Organic traffic ≥ 10K",
-    "keywords":           "Ranking keywords ≥ 100",
-    "traffic_trend":      "Traffic not declining",
-    "existing_backlink":  "No existing backlink",
-    "guest_post_signals": "Not a guest post network",
-    "source_spam":        "No spam in page source",
-    "spam_content":       "No spam content",
-    "hidden_spam":        "No hidden spam links",
-    "topic_drift":        "Topic is consistent",
+    "guest_post_signals":        "Not a guest post network",
+    "spam_keywords_in_source":   "No spam keywords/IPs in source",
+    "spam_content":              "No spam content",
+    "hidden_spam":                "No hidden spam links",
+    "keyword_stuffing":          "No misspelling keyword stuffing",
+    "topic_drift":               "Topic is consistent",
+    "ai_content_farm":           "Not an AI content farm",
+    "back_button_hijack_static": "No back-button hijack JS patterns",
+    "back_button_hijack_dynamic":"Back button returns to same site",
 }
 
 def get_reason(key, result):
-    if key == "existing_backlink" and result.get("already_linked"):
-        return "Client already has a backlink from this site"
     if key == "guest_post_signals":
         if result.get("signals_found"):
             return f"Found: {', '.join(result['signals_found'])}"
         return ""
-    if key == "source_spam":
+    if key == "spam_keywords_in_source":
         parts = []
-        if result.get("spam_keywords_in_source"):
-            parts.append(f"Keywords: {', '.join(result['spam_keywords_in_source'])}")
-        if result.get("hidden_links"):
-            parts.append(f"{len(result['hidden_links'])} hidden link(s)")
-        if result.get("spam_links"):
-            parts.append(f"Spam links found")
+        if result.get("known_keyword_hits"):
+            parts.append(f"Keywords: {', '.join(result['known_keyword_hits'])}")
+        if result.get("hidden_text_keyword_hits"):
+            parts.append(f"Hidden keywords: {', '.join(result['hidden_text_keyword_hits'])}")
+        if result.get("spam_tokens_found"):
+            parts.append(f"Suspicious tokens: {', '.join(result['spam_tokens_found'][:5])}")
+        if result.get("ip_addresses_found"):
+            parts.append(f"{len(result['ip_addresses_found'])} IP(s) in source")
+        if result.get("spam_links_found"):
+            parts.append("Spam link(s) found")
         return " · ".join(parts) if parts else ""
-    if key == "traffic":
-        return f"{result.get('organic_traffic', 0):,} organic visits/mo"
-    if key == "keywords":
-        return f"{result.get('organic_keywords', 0):,} ranking keywords"
+    if key == "keyword_stuffing":
+        clusters = result.get("suspicious_clusters")
+        if clusters:
+            return "Clusters: " + "; ".join(", ".join(c) for c in clusters[:3])
+        return result.get("reason", "")
+    if key == "ai_content_farm":
+        parts = []
+        if result.get("gibberish_slugs_found"):
+            parts.append(f"Gibberish slugs: {', '.join(result['gibberish_slugs_found'])}")
+        if result.get("reason"):
+            parts.append(result["reason"])
+        return " · ".join(parts) if parts else ""
+    if key == "back_button_hijack_static":
+        n = result.get("suspicious_js_patterns_found", 0)
+        return f"{n} suspicious JS pattern(s)" if n else ""
+    if key == "back_button_hijack_dynamic":
+        if result.get("hijacked"):
+            return f"Redirected to {result.get('url_after_back')}"
+        return result.get("reason", "")
     signals = result.get("signals_found")
     if signals:
         return f"Found: {', '.join(signals)}"
@@ -225,7 +241,7 @@ if run:
         st.warning("Please enter a URL.")
     else:
         with st.spinner("Running checks..."):
-            results = check_site(url=url, client_domain="")
+            results = check_site(url=url, run_dynamic_back_button_check=False)
 
         if "error" in results:
             st.error(f"Could not fetch page: {results['error']}")
@@ -251,7 +267,7 @@ if run:
             else:
                 st.markdown(f"""
                 <div class="verdict-review">
-                    <div class="verdict-label">Need a human brain 🧠</div>
+                    <div class="verdict-label">⚠ REVIEW</div>
                     <div class="verdict-sub">Some checks need manual review</div>
                 </div>""", unsafe_allow_html=True)
 
