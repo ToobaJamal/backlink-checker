@@ -39,7 +39,32 @@ SPAM_KEYWORDS_EXTENDED = [
     "situs judi", "rtp slot", "bandar togel", "sbobet", "joker123",
     "pragmatic play", "agen bola", "taruhan bola", "bet365",
 ]
-
+_ALL_SPAM_KEYWORDS = SPAM_KEYWORDS + SPAM_KEYWORDS_EXTENDED
+# Word-boundary patterns so e.g. "adult" doesn't fire inside "adulthood",
+# and multi-word phrases still match as whole phrases.
+_SPAM_KEYWORD_PATTERNS = {
+    kw: re.compile(r'\b' + re.escape(kw) + r'\b', re.IGNORECASE)
+    for kw in _ALL_SPAM_KEYWORDS
+}
+ 
+# For check_spam_keywords_in_source specifically, only match against the
+# unambiguous betting-jargon list (SPAM_KEYWORDS_EXTENDED), not the generic
+# SPAM_KEYWORDS list (adult, crypto, forex, etc.). Those generic words show
+# up constantly in totally legitimate content (news, finance, retail sizing)
+# — judging whether that context is actually spammy is check_spam_content's
+# job (LLM, contextual), not a blind keyword scan of raw source.
+_RAW_SOURCE_KEYWORD_PATTERNS = {
+    kw: pat for kw, pat in _SPAM_KEYWORD_PATTERNS.items() if kw in SPAM_KEYWORDS_EXTENDED
+}
+ 
+ 
+def _keyword_hits(text):
+    return sorted(kw for kw, pat in _SPAM_KEYWORD_PATTERNS.items() if pat.search(text))
+ 
+ 
+def _raw_source_keyword_hits(text):
+    return sorted(kw for kw, pat in _RAW_SOURCE_KEYWORD_PATTERNS.items() if pat.search(text))
+ 
 # IPv4 addresses anywhere in the raw HTML (often hidden in comments, script
 # blocks, or off-screen elements as part of a spam network's footprint).
 IP_ADDRESS_PATTERN = re.compile(
@@ -75,7 +100,7 @@ HIDDEN_STYLE_PATTERN = re.compile(
     r'|font-size\s*:\s*0(?:px)?\b|width\s*:\s*0(?:px)?\s*;\s*height\s*:\s*0)',
     re.IGNORECASE,
 )
-HIDDEN_CLASS_HINTS = ["sr-only", "visually-hidden", "visuallyhidden", "hidden", "d-none", "screen-reader-text"]
+HIDDEN_CLASS_HINTS = {"sr-only", "visually-hidden", "visuallyhidden", "hidden", "d-none", "screen-reader-text"}
  
 # JS patterns associated with back-button / history hijacking.
 BACK_HIJACK_JS_PATTERNS = [
@@ -261,8 +286,8 @@ def extract_hidden_text(html):
             hidden_chunks.append(t)
  
     for tag in soup.find_all(class_=True):
-        classes = " ".join(tag.get("class", [])).lower()
-        if any(hint in classes for hint in HIDDEN_CLASS_HINTS):
+        classes = {c.lower() for c in tag.get("class", [])}
+        if classes & HIDDEN_CLASS_HINTS:
             t = tag.get_text(" ", strip=True)
             if t:
                 hidden_chunks.append(t)
@@ -305,17 +330,16 @@ def check_spam_keywords_in_source(html):
         and not CSS_UNIT_TOKEN_PATTERN.match(m.group(0))
     })
  
-    lower_html = scannable.lower()
-    known_hits = sorted({kw for kw in SPAM_KEYWORDS + SPAM_KEYWORDS_EXTENDED if kw in lower_html})
+    lower_html = scannable
+    known_hits = _raw_source_keyword_hits(lower_html)
  
     hidden_text = extract_hidden_text(html)
-    hidden_hits = sorted({kw for kw in SPAM_KEYWORDS + SPAM_KEYWORDS_EXTENDED if kw in hidden_text.lower()})
+    hidden_hits = _raw_source_keyword_hits(hidden_text)
     hidden_ips = sorted(set(IP_ADDRESS_PATTERN.findall(hidden_text)))
  
     spam_links = sorted({
         a["href"] for a in soup.find_all("a", href=True)
-        if any(kw in a["href"].lower() for kw in SPAM_KEYWORDS + SPAM_KEYWORDS_EXTENDED)
-        or SPAM_TOKEN_PATTERN.search(a["href"])
+        if _raw_source_keyword_hits(a["href"]) or SPAM_TOKEN_PATTERN.search(a["href"])
     })
  
     strong_signal = bool(known_hits or hidden_hits or spam_links)
