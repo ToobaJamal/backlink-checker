@@ -70,7 +70,7 @@ html, body, [class*="css"] {
     border-color: var(--red) !important;
     box-shadow: 0 0 0 2px rgba(208,48,58,0.2) !important;
 }
-label { color: rgba(255,255,255,0.6) !important; font-size: 0.82rem !important; }
+label { color: var(--navy) !important; font-size: 0.82rem !important; }
 
 /* Button */
 .stButton > button {
