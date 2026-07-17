@@ -7,7 +7,7 @@ from collections import Counter
 from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from groq import Groq
 
 # ── Config ────────────────────────────────────────────────────────────────────
