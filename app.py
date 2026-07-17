@@ -5,7 +5,7 @@ from checker import check_site
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Backlink Checker — GMP",
+    page_title="GMP Domain Checker",
     page_icon="⚡",
     layout="centered",
 )
