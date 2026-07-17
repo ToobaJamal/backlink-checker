@@ -39,6 +39,7 @@ SPAM_KEYWORDS_EXTENDED = [
     "situs judi", "rtp slot", "bandar togel", "sbobet", "joker123",
     "pragmatic play", "agen bola", "taruhan bola", "bet365",
 ]
+
 _ALL_SPAM_KEYWORDS = SPAM_KEYWORDS + SPAM_KEYWORDS_EXTENDED
 # Word-boundary patterns so e.g. "adult" doesn't fire inside "adulthood",
 # and multi-word phrases still match as whole phrases.
@@ -49,10 +50,7 @@ _SPAM_KEYWORD_PATTERNS = {
  
 # For check_spam_keywords_in_source specifically, only match against the
 # unambiguous betting-jargon list (SPAM_KEYWORDS_EXTENDED), not the generic
-# SPAM_KEYWORDS list (adult, crypto, forex, etc.). Those generic words show
-# up constantly in totally legitimate content (news, finance, retail sizing)
-# — judging whether that context is actually spammy is check_spam_content's
-# job (LLM, contextual), not a blind keyword scan of raw source.
+# SPAM_KEYWORDS list (adult, crypto, forex, etc.).
 _RAW_SOURCE_KEYWORD_PATTERNS = {
     kw: pat for kw, pat in _SPAM_KEYWORD_PATTERNS.items() if kw in SPAM_KEYWORDS_EXTENDED
 }
@@ -85,7 +83,7 @@ CSS_UNIT_TOKEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
  
-# Common legitimate tokens that would otherwise match SPAM_TOKEN_PATTERN.
+# Common legitimate tokens that would otherwise match SPAM_TOKEN_PATTERN
 SPAM_TOKEN_ALLOWLIST = {
     "covid19", "web3", "gpt4", "gpt3", "gpt5", "iphone15", "iphone16",
     "windows10", "windows11", "top10", "top5", "top100", "24x7", "24x365",
@@ -187,9 +185,7 @@ def fetch_blog_posts(base_url, limit=5):
     return [text for _, text in fetch_blog_posts_with_urls(base_url, limit=limit)]
  
  
-# ── SEMrush checks (disabled) ──────────────────────────────────────────────────
-# Left fully commented out (every line prefixed) so the module stays valid
-# Python even though these aren't wired into check_site() right now.
+# ── SEMrush checks ──────────────────────────────────────────────────
  
 # def semrush_domain_overview(domain):  # costs 10 units per month
 #     url = "https://api.semrush.com/"
@@ -314,15 +310,47 @@ def _scannable_source_text(html):
     return f"{visible_text} {comment_text}"
  
  
+def _extract_comment_text(html):
+    """Text inside HTML comments specifically — a common spot for spam
+    operators to hide config/IPs since it's invisible to users but still in
+    the source."""
+    soup = BeautifulSoup(html, "html.parser")
+    comments = soup.find_all(string=lambda s: isinstance(s, Comment))
+    return " ".join(str(c) for c in comments)
+ 
+ 
+def _domain_has_spam_token(href):
+    """Checks the link's DOMAIN specifically (not the full URL/query
+    string) for a gibberish word+digits token, e.g. '6666bet-casino.xyz'.
+    Restricting to just the domain (vs. the whole href) avoids false
+    positives from ordinary UTM/tracking query parameters."""
+    domain = urlparse(href).netloc.lower()
+    for m in SPAM_TOKEN_PATTERN.finditer(domain):
+        token = m.group(0)
+        if token not in SPAM_TOKEN_ALLOWLIST and not CSS_UNIT_TOKEN_PATTERN.match(token):
+            return True
+    return False
+ 
+ 
 def check_spam_keywords_in_source(html):
     """Scans page TEXT (visible + CSS-hidden + HTML comments) — not raw
     markup — for injected spam keywords/IPs/gibberish tokens, since scanning
     raw HTML picks up SVG path data, CSS, and script/JSON-LD content that
-    isn't spam but matches the same generic patterns."""
+    isn't spam but matches the same generic patterns.
+ 
+    Deliberately conservative: a single stray IP or gibberish-looking token
+    in ordinary page text is common (a documented example IP, a product
+    SKU) and isn't worth flagging alone — only a *cluster*, or an IP
+    specifically hidden via CSS/comments, or an actual known betting-jargon
+    term / spam-domain link, is treated as a real signal."""
     soup = BeautifulSoup(html, "html.parser")
     scannable = _scannable_source_text(html)
+    comment_text = _extract_comment_text(html)
+    hidden_text = extract_hidden_text(html)
  
     ip_addresses = sorted(set(IP_ADDRESS_PATTERN.findall(scannable)))
+    comment_ips = sorted(set(IP_ADDRESS_PATTERN.findall(comment_text)))
+    hidden_ips = sorted(set(IP_ADDRESS_PATTERN.findall(hidden_text)))
  
     spam_tokens = sorted({
         m.group(0) for m in SPAM_TOKEN_PATTERN.finditer(scannable)
@@ -330,25 +358,34 @@ def check_spam_keywords_in_source(html):
         and not CSS_UNIT_TOKEN_PATTERN.match(m.group(0))
     })
  
-    lower_html = scannable
-    known_hits = _raw_source_keyword_hits(lower_html)
- 
-    hidden_text = extract_hidden_text(html)
+    known_hits = _raw_source_keyword_hits(scannable)
     hidden_hits = _raw_source_keyword_hits(hidden_text)
-    hidden_ips = sorted(set(IP_ADDRESS_PATTERN.findall(hidden_text)))
  
+    # Known betting-jargon terms anywhere in the href, OR a gibberish token
+    # specifically in the domain (not the query string, to avoid UTM/version
+    # param false positives).
     spam_links = sorted({
         a["href"] for a in soup.find_all("a", href=True)
-        if _raw_source_keyword_hits(a["href"]) or SPAM_TOKEN_PATTERN.search(a["href"])
+        if _raw_source_keyword_hits(a["href"]) or _domain_has_spam_token(a["href"])
     })
  
+    # Strong signal: precise, low-false-positive-risk evidence.
     strong_signal = bool(known_hits or hidden_hits or spam_links)
-    weak_signal = bool(ip_addresses or spam_tokens or hidden_ips)
+ 
+    # Weak signal: a cluster of visible-text hits, OR any IP specifically
+    # found hidden via CSS or tucked in an HTML comment (both are
+    # deliberate-hiding-adjacent locations, so even one is worth a look).
+    weak_signal = (
+        len(ip_addresses) >= 2
+        or len(spam_tokens) >= 3
+        or len(hidden_ips) >= 1
+        or len(comment_ips) >= 1
+    )
  
     if strong_signal:
         passed = False
     elif weak_signal:
-        passed = None  # ambiguous on its own (e.g. a stray IP) — flag for review
+        passed = None  # cluster of ambiguous signals — flag for review
     else:
         passed = True
  
@@ -359,6 +396,7 @@ def check_spam_keywords_in_source(html):
         "known_keyword_hits": known_hits,
         "hidden_text_keyword_hits": hidden_hits,
         "hidden_text_ip_addresses": hidden_ips[:20],
+        "comment_ip_addresses": comment_ips[:20],
         "spam_links_found": spam_links[:20],
     }
  
@@ -428,12 +466,34 @@ def find_keyword_stuffing_clusters(text, min_count=3, min_cluster=2, similarity=
  
 # ── LLM checks ─────────────────────────────────────────────────────────
  
-def llm_check(prompt):
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.choices[0].message.content.strip()
+import time
+from groq import RateLimitError
+ 
+ 
+class LLMUnavailable(Exception):
+    """Raised when the LLM couldn't be reached after retries (e.g. still
+    rate-limited). Callers should catch this and return a REVIEW-style
+    result instead of letting it crash the whole check_site() run."""
+    pass
+ 
+ 
+def llm_check(prompt, max_retries=3, base_delay=2):
+    """Calls the Groq API with retry + exponential backoff on rate limits.
+    Raises LLMUnavailable if it's still rate-limited after all retries,
+    rather than letting groq.RateLimitError bubble up and crash check_site()."""
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.choices[0].message.content.strip()
+        except RateLimitError:
+            if attempt == max_retries - 1:
+                raise LLMUnavailable(
+                    "Groq API rate limit hit and retries exhausted."
+                )
+            time.sleep(base_delay * (2 ** attempt))  # 2s, 4s, 8s...
  
  
 def _parse_llm_json(raw):
@@ -442,135 +502,97 @@ def _parse_llm_json(raw):
     return json.loads(match.group() if match else cleaned)
  
  
-def check_spam_content(text):
-    snippet = text[:4000]
-    prompt = f"""You are a content quality checker for a link-building agency. You are an expert in SEO best practices and know which links can destroy a client's brand in the long run.
+def check_content_and_source_spam(text, html, clusters):
+    """Combines spam-content, hidden-spam, and keyword-stuffing checks into
+    ONE LLM call (previously 3 separate calls) — they all evaluate the same
+    text/html anyway, so this cuts both request count and repeated
+    instruction-token overhead. Returns three dicts in the same shape the
+    old separate functions returned, so check_site()/app.py don't change."""
+    text_snippet = text[:3000]
+    html_snippet = html[:3000]
  
-Read the following website text and answer:
-1. Does it contain adult, pornographic, or escort content?
-2. Does it contain gambling or casino content?
-3. Does it contain crypto, NFT, or forex content (unless the site is clearly a legitimate finance publication)?
+    cluster_block = ""
+    if clusters:
+        sample = "\n".join(f"- {', '.join(c)}" for c in clusters[:10])
+        cluster_block = f"""
+ 
+4. KEYWORD STUFFING: below are clusters of similarly-spelled words that each appear multiple times on the page. Some are innocent (plurals, verb tenses, common near-synonyms); others are deliberate — a target keyword repeated with slight misspellings to rank for more search variants.
+Clusters found:
+{sample}"""
+ 
+    prompt = f"""You are a content & technical SEO auditor for a link-building agency, screening a site before a client backlink goes live.
+ 
+Evaluate the VISIBLE TEXT and RAW HTML below and answer:
+1. ADULT CONTENT: Does it contain adult, pornographic, or escort content?
+2. GAMBLING: Does it contain gambling or casino content?
+3. CRYPTO: Does it contain crypto, NFT, or forex content (unless clearly a legitimate finance publication)?
+4. HIDDEN SPAM: Are there links/keywords hidden via CSS (display:none, visibility:hidden, opacity:0, font-size:0) or suspicious outbound links to gambling/adult/crypto sites in the HTML?{cluster_block}
  
 You MUST reply ONLY with a valid JSON object and nothing else. No explanation, no preamble.
-Format: {{"adult": true/false, "gambling": true/false, "crypto": true/false, "reason": "one sentence"}}
+Format: {{"adult": true/false, "gambling": true/false, "crypto": true/false, "hidden_spam_detected": true/false, "keyword_stuffing_detected": true/false, "reason": "two to three sentences, one per flagged category"}}
  
-Website text:
-{snippet}"""
+VISIBLE TEXT:
+{text_snippet}
  
-    raw = llm_check(prompt)
+RAW HTML (truncated):
+{html_snippet}"""
+ 
+    try:
+        raw = llm_check(prompt)
+    except LLMUnavailable:
+        rate_limited = {"passed": None, "reason": "LLM rate-limited — needs manual review"}
+        stuffing_fallback = (
+            {"passed": None, "suspicious_clusters": clusters[:10], "reason": "LLM rate-limited — needs manual review"}
+            if clusters else {"passed": True, "suspicious_clusters": []}
+        )
+        return dict(rate_limited), dict(rate_limited), stuffing_fallback
+ 
     try:
         result = _parse_llm_json(raw)
         spam_detected = result.get("adult") or result.get("gambling") or result.get("crypto")
-        return {
+        reason = result.get("reason", "")
+ 
+        spam_content_result = {
             "passed": not spam_detected,
             "adult": result.get("adult", False),
             "gambling": result.get("gambling", False),
             "crypto": result.get("crypto", False),
-            "reason": result.get("reason", ""),
-        }
-    except (json.JSONDecodeError, AttributeError):
-        found = [kw for kw in SPAM_KEYWORDS if kw in text.lower()]
-        return {"passed": len(found) == 0, "fallback": True, "keywords_found": found}
- 
- 
-def check_hidden_spam(html):
-    snippet = html[:5000]
-    prompt = f"""You are a technical SEO auditor checking for spam manipulation.
- 
-Inspect this raw HTML and identify:
-1. Links hidden with CSS (display:none, visibility:hidden, opacity:0, font-size:0, color matching background)
-2. Keyword stuffing hidden from view
-3. Suspicious outbound links to gambling, adult, or crypto sites
- 
-You MUST reply ONLY with a valid JSON object and nothing else. No explanation, no preamble.
-Format: {{"hidden_spam_detected": true/false, "reason": "one sentence"}}
- 
-HTML:
-{snippet}"""
- 
-    raw = llm_check(prompt)
-    try:
-        result = _parse_llm_json(raw)
-        reason = result.get("reason", "")
-        if not reason or reason.lower() == "none":
-            reason = "No hidden spam detected"
-        return {
-            "passed": not result.get("hidden_spam_detected", False),
             "reason": reason,
         }
-    except (json.JSONDecodeError, AttributeError):
-        return {"passed": True, "fallback": True, "reason": "Could not parse LLM response"}
- 
- 
-def check_keyword_stuffing(text):
-    clusters = find_keyword_stuffing_clusters(text)
-    if not clusters:
-        return {"passed": True, "suspicious_clusters": []}
- 
-    sample = "\n".join(f"- {', '.join(c)}" for c in clusters[:10])
-    prompt = f"""You are auditing a website for black-hat SEO keyword stuffing via intentional misspellings.
- 
-Below are clusters of similarly-spelled words that each appear multiple times on the page. Some clusters are innocent (plurals, verb tenses, common near-synonyms). Others are a deliberate tactic where a target keyword is repeated with slight misspellings to rank for more search variants.
- 
-Clusters found:
-{sample}
- 
-You MUST reply ONLY with a valid JSON object and nothing else. No explanation, no preamble.
-Format: {{"keyword_stuffing_detected": true/false, "reason": "one sentence"}}"""
- 
-    raw = llm_check(prompt)
-    try:
-        result = _parse_llm_json(raw)
-        return {
-            "passed": not result.get("keyword_stuffing_detected", False),
-            "suspicious_clusters": clusters[:10],
-            "reason": result.get("reason", ""),
+        hidden_spam_result = {
+            "passed": not result.get("hidden_spam_detected", False),
+            "reason": reason or "No hidden spam detected",
         }
+        if clusters:
+            keyword_stuffing_result = {
+                "passed": not result.get("keyword_stuffing_detected", False),
+                "suspicious_clusters": clusters[:10],
+                "reason": reason,
+            }
+        else:
+            keyword_stuffing_result = {"passed": True, "suspicious_clusters": []}
+        return spam_content_result, hidden_spam_result, keyword_stuffing_result
+ 
     except (json.JSONDecodeError, AttributeError):
-        return {
-            "passed": len(clusters) == 0,
-            "suspicious_clusters": clusters[:10],
-            "fallback": True,
-        }
+        found = [kw for kw in SPAM_KEYWORDS if kw in text.lower()]
+        spam_content_result = {"passed": len(found) == 0, "fallback": True, "keywords_found": found}
+        hidden_spam_result = {"passed": True, "fallback": True, "reason": "Could not parse LLM response"}
+        keyword_stuffing_result = (
+            {"passed": len(clusters) == 0, "suspicious_clusters": clusters[:10], "fallback": True}
+            if clusters else {"passed": True, "suspicious_clusters": []}
+        )
+        return spam_content_result, hidden_spam_result, keyword_stuffing_result
  
  
-def check_topic_drift(base_url):
-    posts = fetch_blog_posts(base_url)
-    if not posts:
-        return {"passed": None, "reason": "Could not find blog posts to sample"}
- 
-    combined = "\n\n---\n\n".join(posts)
-    prompt = f"""You are evaluating a website for a link building campaign.
- 
-Below are excerpts from {len(posts)} blog posts on this site. Judge whether the site has a clear, consistent main topic or drifts wildly across unrelated subjects.
- 
-A site that covers many loosely related topics in one niche is fine.
-A site that randomly covers cooking, crypto, travel, and legal advice is a red flag.
- 
-You MUST reply ONLY with a valid JSON object and nothing else. No explanation, no preamble.
-Format: {{"consistent_topic": true/false, "main_topic": "one sentence", "reason": "one sentence of valid reson. Don't repeat sentences above."}}
- 
-Blog excerpts:
-{combined[:6000]}"""
- 
-    raw = llm_check(prompt)
-    try:
-        result = _parse_llm_json(raw)
-        return {
-            "passed": result.get("consistent_topic", False),
-            "main_topic": result.get("main_topic", ""),
-            "reason": result.get("reason", ""),
-        }
-    except (json.JSONDecodeError, AttributeError):
-        return {"passed": None, "reason": "Could not parse LLM response"}
- 
- 
-def check_ai_content_farm(base_url):
-    """Flags AI content-farm behavior: nonsense/misspelled URL slugs paired
-    with articles that hallucinate a topic for that fake keyword."""
+def check_blog_content_audit(base_url):
+    """Combines topic-drift and AI-content-farm checks into ONE LLM call
+    (previously 2 separate calls), and fetches blog posts only ONCE
+    (previously scraped twice — once per check). Returns two dicts in the
+    same shape the old separate functions returned."""
     posts = fetch_blog_posts_with_urls(base_url)
     if not posts:
-        return {"passed": None, "reason": "Could not find blog posts to sample"}
+        empty = {"passed": None, "reason": "Could not find blog posts to sample"}
+        return dict(empty), dict(empty)
  
     flagged_slugs = []
     excerpt_parts = []
@@ -579,53 +601,71 @@ def check_ai_content_farm(base_url):
         slug = path.split("/")[-1] if path else ""
         if slug and is_gibberish_slug(slug):
             flagged_slugs.append(slug)
-        excerpt_parts.append(f"URL: {link}\nSlug: {slug}\nContent: {text[:1200]}")
+        excerpt_parts.append(f"URL: {link}\nSlug: {slug}\nContent: {text[:900]}")
  
-    combined = "\n\n---\n\n".join(excerpt_parts)
+    combined_excerpts = "\n\n---\n\n".join(excerpt_parts)[:6000]
  
-    prompt = f"""You are an expert at detecting AI-generated content farms used in black-hat link building.
+    prompt = f"""You are evaluating a website for a link-building campaign.
  
-Below are {len(posts)} blog posts (URL, slug, and content excerpt) from a website.
+Below are {len(posts)} blog posts (URL, slug, content excerpt). Judge TWO things:
  
-Signs of an AI content farm to look for:
-- The URL slug is a nonsense or intentionally misspelled string with no real meaning (e.g. "xlecz", "qwrtzop")
-- The article "hallucinates" a definition or topic for that nonsense keyword and writes generic filler content around it
-- The writing is generic, repetitive, templated, or doesn't cite real, checkable facts
-- Multiple posts follow the same hollow pattern, just with a different nonsense keyword swapped in
+1. TOPIC CONSISTENCY: Does the site have a clear, consistent main topic, or does it drift wildly across unrelated subjects? (Many loosely related topics in one niche is fine. Randomly covering cooking, crypto, travel, and legal advice is a red flag.)
+2. AI CONTENT FARM: Signs to look for — nonsense/misspelled URL slugs (e.g. "xlecz"), articles that hallucinate a definition/topic for a fake keyword, generic/repetitive/templated writing with no real checkable facts, the same hollow pattern repeated with different fake keywords.
  
 You MUST reply ONLY with a valid JSON object and nothing else. No explanation, no preamble.
-Format: {{"is_ai_content_farm": true/false, "confidence": "low/medium/high", "reason": "one to two sentences citing specific evidence from the excerpts"}}
+Format: {{"consistent_topic": true/false, "main_topic": "one sentence", "is_ai_content_farm": true/false, "confidence": "low/medium/high", "reason": "one to two sentences covering both judgments"}}
  
 Posts:
-{combined[:7000]}"""
+{combined_excerpts}"""
  
-    raw = llm_check(prompt)
-    llm_flag = None
-    result = {}
     try:
-        result = _parse_llm_json(raw)
-        llm_flag = result.get("is_ai_content_farm", False)
-    except (json.JSONDecodeError, AttributeError):
-        pass
+        raw = llm_check(prompt)
+    except LLMUnavailable:
+        raw = None
  
     slug_ratio = len(flagged_slugs) / len(posts) if posts else 0
     heuristic_flag = slug_ratio >= 0.4  # ~2+ of 5 slugs look like gibberish
  
-    if llm_flag is None:
-        passed = not heuristic_flag
-        reason = "LLM response unparsable; fell back to gibberish-slug heuristic only."
-    else:
-        passed = not (llm_flag or heuristic_flag)
-        reason = result.get("reason", "")
+    if raw is None:
+        topic_result = {"passed": None, "reason": "LLM rate-limited — could not check topic consistency, needs manual review"}
+        ai_farm_result = {
+            "passed": not heuristic_flag,
+            "gibberish_slugs_found": flagged_slugs,
+            "gibberish_slug_ratio": round(slug_ratio, 2),
+            "llm_flag": None,
+            "confidence": "",
+            "reason": "LLM unavailable (rate-limited); fell back to gibberish-slug heuristic only.",
+        }
+        return topic_result, ai_farm_result
  
-    return {
-        "passed": passed,
-        "gibberish_slugs_found": flagged_slugs,
-        "gibberish_slug_ratio": round(slug_ratio, 2),
-        "llm_flag": llm_flag,
-        "confidence": result.get("confidence", ""),
-        "reason": reason,
-    }
+    try:
+        result = _parse_llm_json(raw)
+        topic_result = {
+            "passed": result.get("consistent_topic", False),
+            "main_topic": result.get("main_topic", ""),
+            "reason": result.get("reason", ""),
+        }
+        llm_flag = result.get("is_ai_content_farm", False)
+        ai_farm_result = {
+            "passed": not (llm_flag or heuristic_flag),
+            "gibberish_slugs_found": flagged_slugs,
+            "gibberish_slug_ratio": round(slug_ratio, 2),
+            "llm_flag": llm_flag,
+            "confidence": result.get("confidence", ""),
+            "reason": result.get("reason", ""),
+        }
+        return topic_result, ai_farm_result
+    except (json.JSONDecodeError, AttributeError):
+        topic_result = {"passed": None, "reason": "Could not parse LLM response"}
+        ai_farm_result = {
+            "passed": not heuristic_flag,
+            "gibberish_slugs_found": flagged_slugs,
+            "gibberish_slug_ratio": round(slug_ratio, 2),
+            "llm_flag": None,
+            "confidence": "",
+            "reason": "LLM response unparsable; fell back to gibberish-slug heuristic only.",
+        }
+        return topic_result, ai_farm_result
  
  
 # ── Back-button hijack checks ──────────────────────────────────────────────────
@@ -736,34 +776,23 @@ def check_site(url, run_dynamic_back_button_check=True):
     results["spam_keywords_in_source"] = src_spam
     _print_check("No spam keywords/IPs in source", src_spam)
  
-    # 7. LLM: spam content (visible text)
-    print("Checking spam content...")
-    spam = check_spam_content(text)
+    # 7-9. LLM (combined call): spam content + hidden spam + keyword stuffing
+    print("Checking content & source spam (combined LLM call)...")
+    clusters = find_keyword_stuffing_clusters(text)
+    spam, hidden, stuffing = check_content_and_source_spam(text, html, clusters)
     results["spam_content"] = spam
-    _print_check("No spam content", spam)
- 
-    # 8. LLM: hidden spam links
-    print("Checking hidden spam links...")
-    hidden = check_hidden_spam(html)
     results["hidden_spam"] = hidden
-    _print_check("No hidden spam links", hidden)
- 
-    # 9. Keyword stuffing via intentional misspellings
-    print("Checking for misspelling-based keyword stuffing...")
-    stuffing = check_keyword_stuffing(text)
     results["keyword_stuffing"] = stuffing
+    _print_check("No spam content", spam)
+    _print_check("No hidden spam links", hidden)
     _print_check("No misspelling keyword stuffing", stuffing)
  
-    # 10. LLM: topic drift
-    print("Checking topic consistency...")
-    topic = check_topic_drift(url)
+    # 10-11. LLM (combined call): topic drift + AI content farm
+    print("Checking blog content — topic drift & AI content farm (combined LLM call)...")
+    topic, ai_farm = check_blog_content_audit(url)
     results["topic_drift"] = topic
-    _print_check("Topic is consistent", topic)
- 
-    # 11. AI content farm / hallucinated content on gibberish keywords
-    print("Checking for AI content farm signals...")
-    ai_farm = check_ai_content_farm(url)
     results["ai_content_farm"] = ai_farm
+    _print_check("Topic is consistent", topic)
     _print_check("Not an AI content farm", ai_farm)
  
     # 12. Back-button hijacking (static)
