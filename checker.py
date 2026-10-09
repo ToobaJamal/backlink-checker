@@ -20,6 +20,7 @@ if not GROQ_API_KEY:
 
 client = Groq(api_key=GROQ_API_KEY)
 
+GROQ_MODEL = os.environ.get("GROQ_MODEL") or "openai/gpt-oss-120b"
 
 GUEST_POST_SIGNALS = [
     "write for us", "submit a post", "submit a guest post",
@@ -484,7 +485,7 @@ def llm_check(prompt, max_retries=3, base_delay=2):
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
             )
             return response.choices[0].message.content.strip()
